@@ -7,12 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       target_id:
-        description: "Probely target ID to scan"
-        required: true
+        description: "Probely target ID to scan. Leave blank to use the staging environment variable TARGET_ID."
+        required: false
         type: string
+        default: ""
 
 permissions:
-  contents: read
+  # Needed to commit the scan id state file back to the repo.
+  contents: write
 
 jobs:
   start-scan:
@@ -24,8 +26,16 @@ jobs:
     env:
       # The Probely CLI reads this automatically for authentication.
       PROBELY_API_KEY: ${{ secrets.PROBELY_API_KEY }}
-      TARGET_ID: ${{ inputs.target_id }}
+      # Use the manual input when given; otherwise fall back to the staging
+      # environment variable TARGET_ID (available because the job declares
+      # `environment: staging`).
+      TARGET_ID: ${{ inputs.target_id || vars.TARGET_ID }}
+      # State file the scheduled "Check Probely Scan" workflow polls.
+      STATE_FILE: .probely/scan_id
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -41,14 +51,24 @@ jobs:
         run: |
           missing=0
           [ -z "${PROBELY_API_KEY}" ] && { echo "::error::Secret PROBELY_API_KEY is not set."; missing=1; }
-          [ -z "${TARGET_ID}" ]       && { echo "::error::Input target_id is required."; missing=1; }
+          [ -z "${TARGET_ID}" ]       && { echo "::error::No target id — provide the target_id input or set the staging environment variable TARGET_ID."; missing=1; }
           exit "$missing"
+
+      - name: Get target details
+        id: target
+        run: |
+          set -euo pipefail
+          target_json="$(probely targets get "${TARGET_ID}" -o JSON)"
+          # CLI may return a single object or a one-element array depending on version.
+          target_name="$(jq -r 'if type=="array" then .[0] else . end | .name // .site.name // .id // "Unknown target"' <<<"${target_json}")"
+          echo "Target name: ${target_name}"
+          echo "target_name=${target_name}" >> "$GITHUB_OUTPUT"
 
       - name: Start Probely scan
         id: scan
         run: |
           set -euo pipefail
-          echo "Starting scan for target ${TARGET_ID} ..."
+          echo "Starting scan for target ${TARGET_ID} (${{ steps.target.outputs.target_name }}) ..."
           scan_id="$(probely targets start-scan "${TARGET_ID}" -o IDS_ONLY)"
           if [ -z "${scan_id}" ]; then
             echo "::error::No scan id returned — check the target id and API key."
@@ -57,6 +77,35 @@ jobs:
           echo "Started scan: ${scan_id}"
           echo "scan_id=${scan_id}" >> "$GITHUB_OUTPUT"
 
+      - name: Record scan id to state file
+        # Persist the scan id in the repo so the scheduled checker can pick it
+        # up. A push made with GITHUB_TOKEN does not trigger other workflows.
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "${STATE_FILE}")"
+          echo "${{ steps.scan.outputs.scan_id }}" > "${STATE_FILE}"
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${STATE_FILE}"
+          if git diff --cached --quiet; then
+            echo "State file already up to date."
+            exit 0
+          fi
+          git commit -m "Record Probely scan id ${{ steps.scan.outputs.scan_id }}"
+
+          # Retry the push in case the checker committed concurrently.
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Pushed state file (attempt ${attempt})."
+              exit 0
+            fi
+            echo "Push failed; rebasing and retrying ..."
+            git pull --rebase --autostash origin "${{ github.ref_name }}" || true
+          done
+          echo "::error::Could not push the scan id state file."
+          exit 1
+
       - name: Summary
         run: |
           {
@@ -64,6 +113,7 @@ jobs:
             echo ""
             echo "| Field | Value |"
             echo "| --- | --- |"
+            echo "| Target Name | ${{ steps.target.outputs.target_name }} |"
             echo "| Target ID | \`${TARGET_ID}\` |"
             echo "| Scan ID | \`${{ steps.scan.outputs.scan_id }}\` |"
           } >> "$GITHUB_STEP_SUMMARY"

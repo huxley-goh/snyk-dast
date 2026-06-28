@@ -1,0 +1,185 @@
+name: Check Probely Scan
+
+# Scheduled (every 5 minutes) + manual workflow that checks the Probely
+# (Snyk API & Web) scan recorded in the .probely/scan_id state file.
+#
+#   1. If the state file is empty/missing -> the run reads it and exits early.
+#   2. Otherwise it reads the scan status via the Probely CLI and:
+#        - still running          -> reports the current status
+#        - COMPLETED/UNDER_REVIEW -> reports the findings table
+#        - FAILED/CANCELED        -> reports the error message
+#   3. When the scan reaches a terminal state it clears the state file (commits
+#      it empty) so the same scan is not checked again.
+on:
+  schedule:
+    - cron: "*/5 * * * *" # every 5 minutes (best-effort; GitHub may delay)
+  workflow_dispatch:
+
+permissions:
+  # Needed to commit the cleared state file back to the repo.
+  contents: write
+
+# Avoid overlapping checker runs racing on the state file / git push.
+concurrency:
+  group: probely-check-scan
+  cancel-in-progress: false
+
+jobs:
+  check-scan:
+    name: Check scan status and report
+    runs-on: ubuntu-latest
+    # Required so the job can read the "PROBELY_API_KEY" secret scoped to the
+    # "staging" GitHub Environment. (Note: if "staging" has protection rules
+    # requiring approval, scheduled runs will be blocked — keep it rule-free.)
+    environment: staging
+    env:
+      # The Probely CLI reads this automatically for authentication.
+      PROBELY_API_KEY: ${{ secrets.PROBELY_API_KEY }}
+      STATE_FILE: .probely/scan_id
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Read recorded scan id
+        id: state
+        run: |
+          set -euo pipefail
+          scan_id=""
+          if [ -f "${STATE_FILE}" ]; then
+            scan_id="$(tr -d '[:space:]' < "${STATE_FILE}")"
+          fi
+          if [ -z "${scan_id}" ]; then
+            echo "No scan id recorded — nothing to check."
+          else
+            echo "Recorded scan id: ${scan_id}"
+          fi
+          echo "scan_id=${scan_id}" >> "$GITHUB_OUTPUT"
+
+      # Everything below runs only when a scan id is recorded.
+      - name: Set up Python
+        if: ${{ steps.state.outputs.scan_id != '' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Probely CLI
+        if: ${{ steps.state.outputs.scan_id != '' }}
+        run: |
+          python -m pip install --upgrade pip
+          pip install --upgrade probely
+          echo "Installed Probely CLI: $(pip show probely | awk -F': ' '/^Version/ {print $2}')"
+
+      - name: Validate config
+        if: ${{ steps.state.outputs.scan_id != '' }}
+        run: |
+          [ -z "${PROBELY_API_KEY}" ] && { echo "::error::Secret PROBELY_API_KEY is not set."; exit 1; } || true
+
+      - name: Check scan and report
+        if: ${{ steps.state.outputs.scan_id != '' }}
+        env:
+          SCAN_ID: ${{ steps.state.outputs.scan_id }}
+        run: |
+          set -euo pipefail
+
+          # The CLI may return a single object or a one-element array; this
+          # snippet normalizes to the object either way. JSON is used only to
+          # read the status/error fields — all displayed results use TABLE.
+          OBJ='if type=="array" then .[0] else . end'
+
+          scan_json="$(probely scans get "${SCAN_ID}" -o JSON)"
+          status="$(jq -r "${OBJ} | .status // \"UNKNOWN\"" <<<"${scan_json}" | tr '[:lower:]' '[:upper:]')"
+          echo "Scan ${SCAN_ID} status: ${status}"
+
+          emit() { echo "$1" >> "$GITHUB_STEP_SUMMARY"; }
+
+          emit "# Probely Scan Check"
+          emit ""
+          emit "| Field | Value |"
+          emit "| --- | --- |"
+          emit "| Scan ID | \`${SCAN_ID}\` |"
+          emit "| Status | ${status} |"
+          emit ""
+
+          # Whether the scan reached a terminal state (drives clearing the
+          # state file in a later step). Default: still running.
+          terminal=false
+
+          case "${status}" in
+            COMPLETED|UNDER_REVIEW)
+              terminal=true
+              echo "Scan finished — fetching results ..."
+              findings_table="$(probely findings get --f-scans "${SCAN_ID}" -o TABLE || true)"
+              emit "## Findings"
+              emit ""
+              if [ -n "${findings_table}" ]; then
+                # Wrap in a code block so the fixed-width columns stay aligned.
+                emit '```'
+                printf '%s\n' "${findings_table}" >> "$GITHUB_STEP_SUMMARY"
+                emit '```'
+              else
+                emit "_No findings reported for this scan._"
+              fi
+              printf '%s\n' "${findings_table}"
+              ;;
+
+            FAILED|CANCELED|CANCELING)
+              terminal=true
+              # Surface whatever error/message the scan object carries.
+              msg="$(jq -r "${OBJ} | (.error // .message // .status_message // .reason // \"\")" <<<"${scan_json}")"
+              emit "## Scan did not complete successfully"
+              emit ""
+              if [ -n "${msg}" ] && [ "${msg}" != "null" ]; then
+                emit "**Error:** ${msg}"
+              else
+                emit "No explicit error message was returned. Scan details below."
+              fi
+              emit ""
+              emit '```'
+              probely scans get "${SCAN_ID}" -o TABLE >> "$GITHUB_STEP_SUMMARY" || true
+              emit '```'
+              ;;
+
+            *)
+              # QUEUED, STARTED, FINISHING_UP, PAUSED, RESUMING, etc.
+              emit "Scan is still running (status: **${status}**). Will re-check on the next scheduled run."
+              ;;
+          esac
+
+          # Pass state to later steps.
+          {
+            echo "TERMINAL=${terminal}"
+            echo "FINAL_STATUS=${status}"
+          } >> "$GITHUB_ENV"
+
+      - name: Clear state file when scan is finished
+        # Runs before the failure step below, so the file is always cleared once
+        # the scan is terminal — even when the scan FAILED.
+        if: ${{ env.TERMINAL == 'true' }}
+        run: |
+          set -euo pipefail
+          : > "${STATE_FILE}"   # truncate to empty
+
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${STATE_FILE}"
+          if git diff --cached --quiet; then
+            echo "State file already empty."
+            exit 0
+          fi
+          git commit -m "Clear Probely scan id (scan ${FINAL_STATUS})"
+          for attempt in 1 2 3; do
+            if git push; then
+              echo "Cleared state file (attempt ${attempt})."
+              exit 0
+            fi
+            echo "Push failed; rebasing and retrying ..."
+            git pull --rebase --autostash origin "${{ github.ref_name }}" || true
+          done
+          echo "::error::Could not push the cleared state file."
+          exit 1
+
+      - name: Mark run failed if the scan failed
+        if: ${{ env.FINAL_STATUS == 'FAILED' }}
+        run: |
+          echo "::error::Scan ${{ steps.state.outputs.scan_id }} ended with status FAILED."
+          exit 1
