@@ -43,9 +43,12 @@ status/error) and branches:
 
 | Scan status | Output | State file |
 | --- | --- | --- |
-| Still running (`QUEUED`, `STARTED`, `FINISHING_UP`, `PAUSED`, …) | Reports the current status | left set (re-checked next tick) |
-| `COMPLETED` / `UNDER_REVIEW` | Findings table from `probely findings get --f-scans <scan_id> -o TABLE` | cleared (committed empty) |
+| Still running (`QUEUED`, `STARTED`, `FINISHING_UP`, `PAUSED`, `UNDER_REVIEW`, …) | Reports the current status | left set (re-checked next tick) |
+| `COMPLETED` / `COMPLETED_WITH_ERRORS` | Severity counts (from the scan object) + findings table from `probely findings get --f-scans <scan_id> -o TABLE` | cleared (committed empty) |
 | `FAILED` / `CANCELED` | The scan's error message + scan details (`-o TABLE`); the run is marked failed on `FAILED` | cleared (committed empty) |
+
+> `UNDER_REVIEW` is transitional (awaiting Probely's manual review), so it's
+> treated as still-running and the checker keeps polling until `COMPLETED`.
 
 The state file is cleared *before* the run is failed, so a `FAILED` scan is still
 de-registered and won't be re-checked.

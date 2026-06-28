@@ -105,21 +105,45 @@ jobs:
           terminal=false
 
           case "${status}" in
-            COMPLETED|UNDER_REVIEW)
+            COMPLETED|COMPLETED_WITH_ERRORS)
               terminal=true
-              echo "Scan finished — fetching results ..."
-              findings_table="$(probely findings get --f-scans "${SCAN_ID}" -o TABLE || true)"
+              echo "Scan finished (${status}) — fetching results ..."
+              if [ "${status}" = "COMPLETED_WITH_ERRORS" ]; then
+                emit "> :warning: Scan completed **with errors** — results may be partial."
+                emit ""
+              fi
+
+              # Severity counts come straight from the scan object (reliable,
+              # independent of the findings command).
+              crit="$(jq -r "${OBJ} | .criticals // \"—\"" <<<"${scan_json}")"
+              high="$(jq -r "${OBJ} | .highs // \"—\"" <<<"${scan_json}")"
+              med="$(jq -r "${OBJ} | .mediums // \"—\"" <<<"${scan_json}")"
+              low="$(jq -r "${OBJ} | .lows // \"—\"" <<<"${scan_json}")"
+              emit "## Findings summary"
+              emit ""
+              emit "| Critical | High | Medium | Low |"
+              emit "| --- | --- | --- | --- |"
+              emit "| ${crit} | ${high} | ${med} | ${low} |"
+              emit ""
+
+              # Detailed table from the CLI. Surface failures to the log rather
+              # than hiding them, so an empty table is explainable.
               emit "## Findings"
               emit ""
-              if [ -n "${findings_table}" ]; then
-                # Wrap in a code block so the fixed-width columns stay aligned.
-                emit '```'
-                printf '%s\n' "${findings_table}" >> "$GITHUB_STEP_SUMMARY"
-                emit '```'
+              if findings_table="$(probely findings get --f-scans "${SCAN_ID}" -o TABLE)"; then
+                if [ -n "${findings_table}" ]; then
+                  # Wrap in a code block so the fixed-width columns stay aligned.
+                  emit '```'
+                  printf '%s\n' "${findings_table}" >> "$GITHUB_STEP_SUMMARY"
+                  emit '```'
+                else
+                  emit "_No findings reported for this scan._"
+                fi
+                printf '%s\n' "${findings_table}"
               else
-                emit "_No findings reported for this scan._"
+                emit "_Could not retrieve the findings table — see the run log._"
+                echo "::warning::'probely findings get --f-scans ${SCAN_ID}' failed."
               fi
-              printf '%s\n' "${findings_table}"
               ;;
 
             FAILED|CANCELED|CANCELING)
@@ -140,7 +164,9 @@ jobs:
               ;;
 
             *)
-              # QUEUED, STARTED, FINISHING_UP, PAUSED, RESUMING, etc.
+              # Not yet terminal: QUEUED, STARTED, FINISHING_UP, PAUSED,
+              # PAUSING, RESUMING, and UNDER_REVIEW (awaiting Probely's manual
+              # review, which later becomes COMPLETED).
               emit "Scan is still running (status: **${status}**). Will re-check on the next scheduled run."
               ;;
           esac
