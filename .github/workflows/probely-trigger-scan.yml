@@ -13,8 +13,7 @@ on:
         default: ""
 
 permissions:
-  # Needed to commit the scan id state file back to the repo.
-  contents: write
+  contents: read
 
 jobs:
   start-scan:
@@ -78,8 +77,8 @@ jobs:
           echo "scan_id=${scan_id}" >> "$GITHUB_OUTPUT"
 
       - name: Record scan id to state file
-        # Persist the scan id in the repo so the scheduled checker can pick it
-        # up. A push made with GITHUB_TOKEN does not trigger other workflows.
+        # Written locally, then saved to the GitHub Actions cache in the next
+        # step so the scheduled checker can restore it.
         run: |
           set -euo pipefail
           mkdir -p "$(dirname "${STATE_FILE}")"
@@ -88,8 +87,8 @@ jobs:
       - name: Save scan id to cache
         uses: actions/cache/save@v4
         with:
-          path: ${STATE_FILE}
-          key: scanid-string-${{ github.run_id }}  
+          path: ${{ env.STATE_FILE }}
+          key: scanid-string-${{ github.run_id }}
 
       - name: Summary
         run: |

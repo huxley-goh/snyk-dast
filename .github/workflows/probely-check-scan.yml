@@ -3,23 +3,24 @@ name: Check Probely Scan
 # Scheduled (every 5 minutes) + manual workflow that checks the Probely
 # (Snyk API & Web) scan recorded in the .probely/scan_id state file.
 #
-#   1. If the state file is empty/missing -> the run reads it and exits early.
+#   1. The scan id is restored from the GitHub Actions cache (saved by the
+#      "Trigger Probely Scan" workflow). If none is found -> exit early.
 #   2. Otherwise it reads the scan status via the Probely CLI and:
 #        - still running          -> reports the current status
 #        - COMPLETED/UNDER_REVIEW -> reports the findings table
 #        - FAILED/CANCELED        -> reports the error message
-#   3. When the scan reaches a terminal state it clears the state file (commits
-#      it empty) so the same scan is not checked again.
+#   3. When the scan reaches a terminal state it deletes the scan id cache
+#      entries so the same scan is not checked again.
 on:
   schedule:
     - cron: "*/5 * * * *" # every 5 minutes (best-effort; GitHub may delay)
   workflow_dispatch:
 
 permissions:
-  # Needed to commit the cleared state file back to the repo.
-  contents: write
+  # Needed to delete the scan id cache entry once the scan is finished.
+  actions: write
 
-# Avoid overlapping checker runs racing on the state file / git push.
+# Avoid overlapping checker runs racing on the cache entry.
 concurrency:
   group: probely-check-scan
   cancel-in-progress: false
@@ -41,10 +42,13 @@ jobs:
         id: cache-restore
         uses: actions/cache/restore@v4
         with:
-          path: ${STATE_FILE}
-          key: shared-string-restore-${{ github.run_id }}
+          path: ${{ env.STATE_FILE }}
+          # The exact key never exists (run_id is new each run); the prefix in
+          # restore-keys makes it restore the most recent "scanid-string-*"
+          # cache saved by the trigger workflow.
+          key: scanid-string-${{ github.run_id }}
           restore-keys: |
-            shared-string-
+            scanid-string-
 
       - name: Read recorded scan id
         id: state
@@ -183,32 +187,24 @@ jobs:
             echo "FINAL_STATUS=${status}"
           } >> "$GITHUB_ENV"
 
-      - name: Clear state file when scan is finished
-        # Runs before the failure step below, so the file is always cleared once
-        # the scan is terminal — even when the scan FAILED.
+      - name: Delete scan id from cache when scan is finished
+        # Runs before the failure step below, so the cache entry is always
+        # removed once the scan is terminal — even when the scan FAILED.
         if: ${{ env.TERMINAL == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          : > "${STATE_FILE}"   # truncate to empty
-
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add "${STATE_FILE}"
-          if git diff --cached --quiet; then
-            echo "State file already empty."
+          ids="$(gh cache list --key scanid-string- --limit 100 --json id --jq '.[].id')"
+          if [ -z "${ids}" ]; then
+            echo "No scan id cache entries to delete."
             exit 0
           fi
-          git commit -m "Clear Probely scan id (scan ${FINAL_STATUS})"
-          for attempt in 1 2 3; do
-            if git push; then
-              echo "Cleared state file (attempt ${attempt})."
-              exit 0
-            fi
-            echo "Push failed; rebasing and retrying ..."
-            git pull --rebase --autostash origin "${{ github.ref_name }}" || true
+          for id in ${ids}; do
+            gh cache delete "${id}"
           done
-          echo "::error::Could not push the cleared state file."
-          exit 1
+          echo "Deleted scan id cache entries."
 
       - name: Mark run failed if the scan failed
         if: ${{ env.FINAL_STATUS == 'FAILED' }}
