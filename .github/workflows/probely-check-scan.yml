@@ -37,8 +37,14 @@ jobs:
       PROBELY_API_KEY: ${{ secrets.PROBELY_API_KEY }}
       STATE_FILE: .probely/scan_id
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Restore latest scan ID from cache
+        id: cache-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: ${STATE_FILE}
+          key: shared-string-restore-${{ github.run_id }}
+          restore-keys: |
+            shared-string-
 
       - name: Read recorded scan id
         id: state
